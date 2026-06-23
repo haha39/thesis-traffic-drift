@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+runs/*
+!runs/.gitkeep
+*.npy
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+.env
