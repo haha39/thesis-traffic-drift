@@ -4,6 +4,7 @@ __pycache__/
 venv/
 runs/*
 !runs/.gitkeep
+artifacts/local/
 *.npy
 *.h5
 *.pt
