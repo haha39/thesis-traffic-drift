@@ -1,0 +1,29 @@
+experiment_id: EXP-001-stale-degradation-v0
+input_artifacts:
+  root: artifacts/local/exp-001
+output:
+  root: artifacts/local/exp-001/baselines
+window:
+  input_length: 144
+  horizon: 1
+baselines:
+  enabled:
+    last_value: true
+    historical_average: true
+evaluation:
+  splits:
+    clean_test_predrift: true
+    drifted_test_postdrift: true
+metrics:
+  masked_mae: true
+  masked_rmse: true
+  masked_smape: true
+  degradation_ratio: true
+unreliable_gap:
+  status: deferred_human_threshold_required
+holdout:
+  use: false
+dependencies:
+  neural: deferred
+gpu:
+  use: false
