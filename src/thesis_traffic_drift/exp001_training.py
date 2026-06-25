@@ -24,8 +24,10 @@ from thesis_traffic_drift.exp001 import DenseArrays, parse_simple_yaml, write_js
 REQUIRED_ARRAY_MEMBERS = ("values", "observed_mask", "state_code", "timestamp_ms", "cell_ids")
 TRAIN_SPLIT = "clean_train"
 EVALUATION_SPLITS = ("clean_test_predrift", "drifted_test_postdrift")
+DIAGNOSTIC_SPLITS = ("clean_test_predrift", "clean_test_postdrift", "drifted_test_postdrift")
 BASELINES = ("last_value", "historical_average")
 METRICS = ("masked_mae", "masked_rmse", "masked_smape")
+DIAGNOSTIC_GROUPS = ("all_top100", "affected20", "unaffected80")
 
 
 @dataclass(frozen=True)
@@ -195,6 +197,60 @@ def load_required_artifacts(input_dir: Path) -> Dict[str, DenseArrays]:
     return {split: load_materialized_npz(artifact_path(input_dir, split)) for split in required}
 
 
+def load_diagnostic_artifacts(input_dir: Path) -> Dict[str, DenseArrays]:
+    required = (TRAIN_SPLIT,) + DIAGNOSTIC_SPLITS
+    return {split: load_materialized_npz(artifact_path(input_dir, split)) for split in required}
+
+
+def load_cell_selection(path: Path) -> List[int]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required EXP-001 cell selection file: {path}")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if "cell_id" not in (reader.fieldnames or []):
+            raise ValueError(f"{path} must contain a cell_id column")
+        return [int(row["cell_id"]) for row in reader]
+
+
+def validate_diagnostic_grouping(input_dir: Path, artifacts: Mapping[str, DenseArrays]) -> Dict[str, Any]:
+    eval_cell_ids = list(artifacts["clean_test_predrift"].cell_ids)
+    if len(eval_cell_ids) != 100:
+        raise ValueError(f"EXP-001 diagnosis requires Top-100 evaluation cells, got {len(eval_cell_ids)}")
+    if len(set(eval_cell_ids)) != 100:
+        raise ValueError("EXP-001 diagnosis requires unique Top-100 evaluation cell IDs")
+    for split in DIAGNOSTIC_SPLITS:
+        if list(artifacts[split].cell_ids) != eval_cell_ids:
+            raise ValueError(f"{split} cell IDs do not match clean_test_predrift")
+    clean_post = artifacts["clean_test_postdrift"]
+    drifted_post = artifacts["drifted_test_postdrift"]
+    if clean_post.timestamp_ms != drifted_post.timestamp_ms or clean_post.cell_ids != drifted_post.cell_ids:
+        raise ValueError("clean_test_postdrift and drifted_test_postdrift must have matching timestamps and cell IDs")
+
+    affected_ids = load_cell_selection(input_dir / "selection" / "affected20_cells.csv")
+    if len(affected_ids) != 20:
+        raise ValueError(f"EXP-001 diagnosis requires 20 affected cells, got {len(affected_ids)}")
+    if len(set(affected_ids)) != 20:
+        raise ValueError("EXP-001 affected cell selection contains duplicate cell IDs")
+    missing = sorted(set(affected_ids) - set(eval_cell_ids))
+    if missing:
+        raise ValueError(f"Affected cell IDs are missing from evaluation arrays: {missing}")
+
+    affected_set = set(affected_ids)
+    affected_indices = [index for index, cell_id in enumerate(eval_cell_ids) if cell_id in affected_set]
+    unaffected_indices = [index for index, cell_id in enumerate(eval_cell_ids) if cell_id not in affected_set]
+    if len(affected_indices) != 20 or len(unaffected_indices) != 80:
+        raise ValueError("Affected/unaffected grouping must resolve to 20 affected and 80 unaffected cells")
+    return {
+        "cell_ids": eval_cell_ids,
+        "groups": {
+            "all_top100": list(range(len(eval_cell_ids))),
+            "affected20": affected_indices,
+            "unaffected80": unaffected_indices,
+        },
+        "affected_cell_ids": affected_ids,
+    }
+
+
 def iter_window_targets(dense: DenseArrays, input_length: int, horizon: int) -> Iterator[WindowTarget]:
     if input_length < 1:
         raise ValueError("input_length must be positive")
@@ -268,6 +324,36 @@ def evaluate_historical_average(dense: DenseArrays, means: Sequence[Optional[flo
     return metric_payload(accumulator, window_count)
 
 
+def evaluate_last_value_for_cells(dense: DenseArrays, cell_indices: Sequence[int], input_length: int, horizon: int) -> Dict[str, Any]:
+    accumulator = MetricAccumulator()
+    window_count = 0
+    for target in iter_window_targets(dense, input_length, horizon):
+        window_count += 1
+        target_values = dense.values[target.target_index]
+        target_mask = dense.observed_mask[target.target_index]
+        for col in cell_indices:
+            accumulator.add(target_values[col], last_value_prediction(dense, target, col, input_length), target_mask[col])
+    return diagnostic_metric_payload(accumulator, window_count, len(cell_indices))
+
+
+def evaluate_historical_average_for_cells(
+    dense: DenseArrays,
+    means: Sequence[Optional[float]],
+    cell_indices: Sequence[int],
+    input_length: int,
+    horizon: int,
+) -> Dict[str, Any]:
+    accumulator = MetricAccumulator()
+    window_count = 0
+    for target in iter_window_targets(dense, input_length, horizon):
+        window_count += 1
+        target_values = dense.values[target.target_index]
+        target_mask = dense.observed_mask[target.target_index]
+        for col in cell_indices:
+            accumulator.add(target_values[col], means[col], target_mask[col])
+    return diagnostic_metric_payload(accumulator, window_count, len(cell_indices))
+
+
 def metric_payload(accumulator: MetricAccumulator, window_count: int) -> Dict[str, Any]:
     payload = accumulator.metrics()
     payload.update(
@@ -286,10 +372,126 @@ def metric_payload(accumulator: MetricAccumulator, window_count: int) -> Dict[st
     return payload
 
 
+def diagnostic_metric_payload(accumulator: MetricAccumulator, window_count: int, cell_count: int) -> Dict[str, Any]:
+    payload = metric_payload(accumulator, window_count)
+    evaluated_position_count = window_count * cell_count
+    observed_target_count = accumulator.valid_count + accumulator.unavailable_prediction_count
+    payload.update(
+        {
+            "cell_count": cell_count,
+            "evaluated_position_count": evaluated_position_count,
+            "observed_target_count": observed_target_count,
+            "mask_coverage": (observed_target_count / evaluated_position_count) if evaluated_position_count else None,
+        }
+    )
+    return payload
+
+
 def degradation_ratio(pre_value: Optional[float], post_value: Optional[float]) -> Optional[float]:
     if pre_value is None or post_value is None or pre_value == 0.0:
         return None
     return post_value / pre_value
+
+
+def ratio_rows_for_diagnostics(group_rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    by_key = {(row["baseline"], row["split"], row["group"]): row for row in group_rows}
+    comparisons = [
+        ("clean_predrift_vs_clean_postdrift", "clean_test_predrift", "clean_test_postdrift", "clean_test_predrift_metric"),
+        ("clean_postdrift_vs_drifted_postdrift", "clean_test_postdrift", "drifted_test_postdrift", "clean_test_postdrift_same_window_metric"),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for baseline in BASELINES:
+        for group in DIAGNOSTIC_GROUPS:
+            for comparison, denominator_split, numerator_split, denominator_label in comparisons:
+                denominator = by_key[(baseline, denominator_split, group)]
+                numerator = by_key[(baseline, numerator_split, group)]
+                row: Dict[str, Any] = {
+                    "baseline": baseline,
+                    "baseline_treatment": baseline_treatment(baseline),
+                    "group": group,
+                    "comparison": comparison,
+                    "numerator_split": numerator_split,
+                    "denominator_split": denominator_split,
+                    "denominator_label": denominator_label,
+                }
+                for metric in METRICS:
+                    row[f"{metric}_ratio"] = degradation_ratio(denominator[metric], numerator[metric])
+                rows.append(row)
+    return rows
+
+
+def baseline_treatment(baseline: str) -> str:
+    if baseline == "last_value":
+        return "adaptive_sanity_baseline_not_stale_model_evidence"
+    if baseline == "historical_average":
+        return "primary_stale_baseline_diagnostic_train_only_observed_values"
+    raise ValueError(f"Unknown baseline {baseline!r}")
+
+
+def evaluate_diagnostic_baseline(
+    baseline: str,
+    dense: DenseArrays,
+    means: Sequence[Optional[float]],
+    cell_indices: Sequence[int],
+    input_length: int,
+    horizon: int,
+) -> Dict[str, Any]:
+    if baseline == "last_value":
+        return evaluate_last_value_for_cells(dense, cell_indices, input_length, horizon)
+    if baseline == "historical_average":
+        return evaluate_historical_average_for_cells(dense, means, cell_indices, input_length, horizon)
+    raise ValueError(f"Unknown baseline {baseline!r}")
+
+
+def run_baseline_diagnostics(input_dir: Path, input_length: int = 144, horizon: int = 1, input_label: Optional[str] = None) -> Dict[str, Any]:
+    artifacts = load_diagnostic_artifacts(input_dir)
+    grouping = validate_diagnostic_grouping(input_dir, artifacts)
+    means = fit_historical_average(artifacts[TRAIN_SPLIT])
+    group_rows: List[Dict[str, Any]] = []
+    per_cell_rows: List[Dict[str, Any]] = []
+    affected_cell_set = set(grouping["affected_cell_ids"])
+    for baseline in BASELINES:
+        for split in DIAGNOSTIC_SPLITS:
+            for group_name, cell_indices in grouping["groups"].items():
+                metrics = evaluate_diagnostic_baseline(baseline, artifacts[split], means, cell_indices, input_length, horizon)
+                row = {
+                    "baseline": baseline,
+                    "baseline_treatment": baseline_treatment(baseline),
+                    "split": split,
+                    "group": group_name,
+                }
+                row.update(metrics)
+                group_rows.append(row)
+            for cell_index, cell_id in enumerate(grouping["cell_ids"]):
+                metrics = evaluate_diagnostic_baseline(baseline, artifacts[split], means, [cell_index], input_length, horizon)
+                row = {
+                    "baseline": baseline,
+                    "baseline_treatment": baseline_treatment(baseline),
+                    "split": split,
+                    "cell_id": cell_id,
+                    "group": "affected20" if cell_id in affected_cell_set else "unaffected80",
+                }
+                row.update(metrics)
+                per_cell_rows.append(row)
+    ratio_rows = ratio_rows_for_diagnostics(group_rows)
+    return {
+        "experiment_id": "EXP-001-stale-degradation-v0",
+        "diagnosis_status": "local-only_diagnostic_not_thesis_result",
+        "input_artifacts_root": public_input_label(input_dir, input_label),
+        "window": {"input_length": input_length, "horizon": horizon},
+        "historical_average_treatment": baseline_treatment("historical_average"),
+        "last_value_treatment": baseline_treatment("last_value"),
+        "same_window_synthetic_drift_comparison": "clean_test_postdrift_vs_drifted_test_postdrift",
+        "grouping": {
+            "top100_count": len(grouping["cell_ids"]),
+            "affected_count": len(grouping["groups"]["affected20"]),
+            "unaffected_count": len(grouping["groups"]["unaffected80"]),
+        },
+        "normalization_statistics": training_observed_statistics(artifacts[TRAIN_SPLIT]),
+        "group_metrics": group_rows,
+        "per_cell_metrics": per_cell_rows,
+        "comparison_ratios": ratio_rows,
+    }
 
 
 def public_input_label(input_dir: Path, label: Optional[str] = None) -> str:
@@ -354,6 +556,119 @@ def summary_rows(results: Mapping[str, Any]) -> List[Dict[str, Any]]:
         ratio_row.update({"window_count": "", "valid_position_count": "", "unobserved_target_count": "", "unavailable_prediction_count": "", "status": ""})
         rows.append(ratio_row)
     return rows
+
+
+DIAGNOSTIC_METRIC_FIELDNAMES = [
+    "baseline",
+    "baseline_treatment",
+    "split",
+    "group",
+    "cell_id",
+    "masked_mae",
+    "masked_rmse",
+    "masked_smape",
+    "window_count",
+    "cell_count",
+    "evaluated_position_count",
+    "observed_target_count",
+    "valid_position_count",
+    "unobserved_target_count",
+    "unavailable_prediction_count",
+    "mask_coverage",
+    "status",
+]
+
+
+def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def diagnostic_summary_rows(results: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+    for ratio in results["comparison_ratios"]:
+        if ratio["baseline"] == "historical_average" and ratio["comparison"] == "clean_postdrift_vs_drifted_postdrift":
+            rows.append(ratio)
+    return rows
+
+
+def counts_summary_rows(results: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    fields = [
+        "baseline",
+        "baseline_treatment",
+        "split",
+        "group",
+        "window_count",
+        "cell_count",
+        "evaluated_position_count",
+        "observed_target_count",
+        "valid_position_count",
+        "unobserved_target_count",
+        "unavailable_prediction_count",
+        "mask_coverage",
+        "status",
+    ]
+    return [{field: row.get(field) for field in fields} for row in results["group_metrics"]]
+
+
+def write_diagnostic_results(output_dir: Path, results: Mapping[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "diagnosis_summary.json", results)
+    _write_csv(
+        output_dir / "diagnosis_summary.csv",
+        [
+            "baseline",
+            "baseline_treatment",
+            "group",
+            "comparison",
+            "numerator_split",
+            "denominator_split",
+            "denominator_label",
+            "masked_mae_ratio",
+            "masked_rmse_ratio",
+            "masked_smape_ratio",
+        ],
+        diagnostic_summary_rows(results),
+    )
+    _write_csv(output_dir / "group_metrics.csv", DIAGNOSTIC_METRIC_FIELDNAMES, results["group_metrics"])
+    _write_csv(output_dir / "per_cell_metrics.csv", DIAGNOSTIC_METRIC_FIELDNAMES, results["per_cell_metrics"])
+    _write_csv(
+        output_dir / "comparison_ratios.csv",
+        [
+            "baseline",
+            "baseline_treatment",
+            "group",
+            "comparison",
+            "numerator_split",
+            "denominator_split",
+            "denominator_label",
+            "masked_mae_ratio",
+            "masked_rmse_ratio",
+            "masked_smape_ratio",
+        ],
+        results["comparison_ratios"],
+    )
+    _write_csv(
+        output_dir / "counts_summary.csv",
+        [
+            "baseline",
+            "baseline_treatment",
+            "split",
+            "group",
+            "window_count",
+            "cell_count",
+            "evaluated_position_count",
+            "observed_target_count",
+            "valid_position_count",
+            "unobserved_target_count",
+            "unavailable_prediction_count",
+            "mask_coverage",
+            "status",
+        ],
+        counts_summary_rows(results),
+    )
 
 
 def write_results(output_dir: Path, results: Mapping[str, Any]) -> None:

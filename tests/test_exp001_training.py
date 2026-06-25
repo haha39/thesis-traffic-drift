@@ -17,30 +17,65 @@ if str(SRC_ROOT) not in sys.path:
 from scripts.run_exp001_baselines import main as cli_main
 from scripts.run_exp001_baselines import ensure_writable_output
 from scripts.run_exp001_baselines import validate_output_dir
+from scripts.diagnose_exp001_baselines import main as diagnose_cli_main
+from scripts.diagnose_exp001_baselines import validate_output_dir as validate_diagnostic_output_dir
 from thesis_traffic_drift.exp001 import DenseArrays, STATE_ABSENT, STATE_NUMERIC_OBSERVED, write_npz
 from thesis_traffic_drift.exp001_training import (
     fit_historical_average,
     iter_window_targets,
     load_baseline_config,
     load_materialized_npz,
+    run_baseline_diagnostics,
     run_baselines,
+    validate_diagnostic_grouping,
 )
 
 
 CONFIG_PATH = Path("configs/EXP-001-baselines.template.yaml")
 
 
-def dense(values, masks=None):
+def dense(values, masks=None, cell_ids=None):
     if masks is None:
         masks = [[1 for _ in row] for row in values]
+    if cell_ids is None:
+        cell_ids = list(range(1, len(values[0]) + 1))
     states = [[STATE_NUMERIC_OBSERVED if mask else STATE_ABSENT for mask in row] for row in masks]
     return DenseArrays(
         values=values,
         observed_mask=masks,
         state_code=states,
         timestamp_ms=[index * 600000 for index in range(len(values))],
-        cell_ids=list(range(1, len(values[0]) + 1)),
+        cell_ids=cell_ids,
     )
+
+
+def write_selection(path, cell_ids):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write("rank,cell_id,training_mean_observed_numeric\n")
+        for rank, cell_id in enumerate(cell_ids, start=1):
+            handle.write(f"{rank},{cell_id},{1000.0 - rank}\n")
+
+
+def synthetic_diagnostic_root(tmp_path):
+    root = Path(tmp_path) / "exp-001"
+    arrays_dir = root / "arrays"
+    arrays_dir.mkdir(parents=True)
+    cell_ids = list(range(1001, 1101))
+    affected = cell_ids[:20]
+    train = dense([[10.0] * 100, [10.0] * 100], cell_ids=cell_ids)
+    pre = dense([[10.0] * 100, [10.0] * 100, [10.0] * 100], cell_ids=cell_ids)
+    clean_post = dense([[20.0] * 100, [20.0] * 100, [20.0] * 100], cell_ids=cell_ids)
+    drifted_rows = []
+    for _ in range(3):
+        drifted_rows.append([30.0 if index < 20 else 20.0 for index in range(100)])
+    drifted_post = dense(drifted_rows, cell_ids=cell_ids)
+    write_npz(arrays_dir / "clean_train.npz", train)
+    write_npz(arrays_dir / "clean_test_predrift.npz", pre)
+    write_npz(arrays_dir / "clean_test_postdrift.npz", clean_post)
+    write_npz(arrays_dir / "drifted_test_postdrift.npz", drifted_post)
+    write_selection(root / "selection" / "affected20_cells.csv", affected)
+    return root, cell_ids, affected
 
 
 class Exp001TrainingTests(unittest.TestCase):
@@ -217,6 +252,125 @@ class Exp001TrainingTests(unittest.TestCase):
                 self.assertEqual(payload["input_artifacts_root"], "local-only-input-artifacts")
                 self.assertEqual(payload["holdout_status"], "not_loaded_not_used_exp001_v0")
                 self.assertEqual(payload["baselines"]["last_value"]["clean_test_predrift"]["window_count"], 0)
+            finally:
+                shutil.rmtree(output_dir, ignore_errors=True)
+
+    def test_diagnostic_grouping_requires_top100_affected20_and_same_window_alignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, cell_ids, affected = synthetic_diagnostic_root(tmp)
+            artifacts = {
+                split: load_materialized_npz(root / "arrays" / f"{split}.npz")
+                for split in ("clean_test_predrift", "clean_test_postdrift", "drifted_test_postdrift")
+            }
+
+            grouping = validate_diagnostic_grouping(root, artifacts)
+
+        self.assertEqual(grouping["cell_ids"], cell_ids)
+        self.assertEqual(len(grouping["groups"]["all_top100"]), 100)
+        self.assertEqual(len(grouping["groups"]["affected20"]), 20)
+        self.assertEqual(len(grouping["groups"]["unaffected80"]), 80)
+        self.assertEqual(grouping["affected_cell_ids"], affected)
+
+    def test_diagnostic_historical_average_same_window_ratios_and_per_cell_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, cell_ids, _ = synthetic_diagnostic_root(tmp)
+
+            results = run_baseline_diagnostics(root, input_length=1, horizon=1)
+
+        ratios = {
+            (row["baseline"], row["group"], row["comparison"]): row
+            for row in results["comparison_ratios"]
+        }
+        affected_ratio = ratios[("historical_average", "affected20", "clean_postdrift_vs_drifted_postdrift")]
+        unaffected_ratio = ratios[("historical_average", "unaffected80", "clean_postdrift_vs_drifted_postdrift")]
+        all_ratio = ratios[("historical_average", "all_top100", "clean_postdrift_vs_drifted_postdrift")]
+        self.assertEqual(affected_ratio["denominator_split"], "clean_test_postdrift")
+        self.assertEqual(affected_ratio["numerator_split"], "drifted_test_postdrift")
+        self.assertEqual(affected_ratio["denominator_label"], "clean_test_postdrift_same_window_metric")
+        self.assertAlmostEqual(affected_ratio["masked_mae_ratio"], 2.0)
+        self.assertAlmostEqual(unaffected_ratio["masked_mae_ratio"], 1.0)
+        self.assertAlmostEqual(all_ratio["masked_mae_ratio"], 1.2)
+
+        first_cell = [
+            row for row in results["per_cell_metrics"]
+            if row["baseline"] == "historical_average"
+            and row["split"] == "drifted_test_postdrift"
+            and row["cell_id"] == cell_ids[0]
+        ][0]
+        self.assertEqual(first_cell["group"], "affected20")
+        self.assertEqual(first_cell["window_count"], 2)
+        self.assertEqual(first_cell["valid_position_count"], 2)
+        self.assertAlmostEqual(first_cell["masked_mae"], 20.0)
+
+    def test_diagnostic_last_value_is_labeled_adaptive_not_stale_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, _ = synthetic_diagnostic_root(tmp)
+
+            results = run_baseline_diagnostics(root, input_length=1, horizon=1)
+
+        self.assertEqual(results["last_value_treatment"], "adaptive_sanity_baseline_not_stale_model_evidence")
+        last_rows = [row for row in results["group_metrics"] if row["baseline"] == "last_value"]
+        self.assertTrue(last_rows)
+        self.assertTrue(all(row["baseline_treatment"] == "adaptive_sanity_baseline_not_stale_model_evidence" for row in last_rows))
+
+    def test_diagnostic_missing_prediction_and_unobserved_target_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, _ = synthetic_diagnostic_root(tmp)
+            cell_ids = list(range(1001, 1101))
+            train_masks = [[1] * 99 + [0], [1] * 99 + [0]]
+            target_masks = [[1] * 100, [1] * 99 + [0], [1] * 100]
+            train = dense([[10.0] * 100, [10.0] * 100], masks=train_masks, cell_ids=cell_ids)
+            pre = dense([[10.0] * 100, [10.0] * 100, [10.0] * 100], masks=target_masks, cell_ids=cell_ids)
+            write_npz(root / "arrays" / "clean_train.npz", train)
+            write_npz(root / "arrays" / "clean_test_predrift.npz", pre)
+
+            results = run_baseline_diagnostics(root, input_length=1, horizon=1)
+
+        pre_all = [
+            row for row in results["group_metrics"]
+            if row["baseline"] == "historical_average" and row["split"] == "clean_test_predrift" and row["group"] == "all_top100"
+        ][0]
+        self.assertEqual(pre_all["window_count"], 2)
+        self.assertEqual(pre_all["evaluated_position_count"], 200)
+        self.assertEqual(pre_all["unobserved_target_count"], 1)
+        self.assertEqual(pre_all["unavailable_prediction_count"], 1)
+        self.assertEqual(pre_all["valid_position_count"], 198)
+        self.assertAlmostEqual(pre_all["mask_coverage"], 199 / 200)
+
+    def test_diagnostic_cli_output_guard_dry_run_and_public_safe_payload(self):
+        validate_diagnostic_output_dir(Path("artifacts/local/exp-001/baselines/diagnostics"))
+        with self.assertRaises(SystemExit):
+            validate_diagnostic_output_dir(Path("runs/exp-001-diagnostics"))
+
+        output_dir = REPO_ROOT / "artifacts" / "local" / "exp001-diagnostic-cli-test"
+        shutil.rmtree(output_dir, ignore_errors=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, _ = synthetic_diagnostic_root(tmp)
+            argv = [
+                "diagnose_exp001_baselines.py",
+                "--input-dir",
+                str(root),
+                "--output-dir",
+                str(output_dir),
+                "--overwrite",
+            ]
+
+            try:
+                stdout = io.StringIO()
+                with patch.object(sys, "argv", argv), redirect_stdout(stdout):
+                    self.assertEqual(diagnose_cli_main(), 0)
+                self.assertTrue((output_dir / "diagnosis_summary.json").exists())
+                self.assertTrue((output_dir / "group_metrics.csv").exists())
+                self.assertTrue((output_dir / "per_cell_metrics.csv").exists())
+                self.assertTrue((output_dir / "comparison_ratios.csv").exists())
+                self.assertTrue((output_dir / "counts_summary.csv").exists())
+                payload = json.loads((output_dir / "diagnosis_summary.json").read_text(encoding="utf-8"))
+                serialized = json.dumps(payload)
+                self.assertNotIn(str(root), stdout.getvalue())
+                self.assertNotIn(str(root), serialized)
+                self.assertNotIn("/home/", serialized)
+                self.assertEqual(payload["input_artifacts_root"], "local-only-input-artifacts")
+                self.assertNotIn("holdout", serialized.lower())
             finally:
                 shutil.rmtree(output_dir, ignore_errors=True)
 
