@@ -1,0 +1,37 @@
+experiment_id: EXP-001-stale-degradation-v0
+dataset:
+  name: milan_internet
+  raw_dir_env: MILAN_RAW_DIR
+  raw_dir: null
+  timezone: Europe/Rome
+  resolution_minutes: 10
+  expected_cells: 10000
+selection:
+  k: 100
+  topk_source_segment: train
+  rank_metric: training_period_mean_traffic
+  tie_break: ascending_cell_id
+splits:
+  train:
+    start: "2013-11-01 00:00"
+    end: "2013-11-29 00:00"
+  validation:
+    start: "2013-11-29 00:00"
+    end: "2013-12-06 00:00"
+  test:
+    start: "2013-12-06 00:00"
+    end: "2013-12-20 00:00"
+  holdout:
+    start: "2013-12-20 00:00"
+    end: dataset_end
+drift:
+  point: "2013-12-13 00:00"
+  rule: multiplicative_level_shift
+  factor: 1.5
+  affected_fraction_of_topk: 0.20
+  boundary_inclusive: true
+outputs:
+  root: artifacts/local/exp-001
+missing_policy:
+  modeling_policy: null
+  status: human_decision_required
