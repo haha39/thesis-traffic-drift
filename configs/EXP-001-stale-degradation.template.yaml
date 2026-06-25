@@ -33,5 +33,11 @@ drift:
 outputs:
   root: artifacts/local/exp-001
 missing_policy:
-  modeling_policy: null
-  status: human_decision_required
+  modeling_policy: observed_numeric_with_explicit_mask
+  status: approved_exp001_v0
+  numeric_observed: actual_numeric_value
+  all_null: missing_unobserved_placeholder_zero
+  absent: missing_unobserved_placeholder_zero
+  invalid_only: missing_unobserved_placeholder_zero
+  placeholder_zero_requires_observed_mask_zero: true
+  normalization_fit_scope: training_period_observed_numeric_values_only

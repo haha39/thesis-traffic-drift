@@ -6,6 +6,7 @@ runs/*
 !runs/.gitkeep
 artifacts/local/
 *.npy
+*.npz
 *.h5
 *.pt
 *.pth
