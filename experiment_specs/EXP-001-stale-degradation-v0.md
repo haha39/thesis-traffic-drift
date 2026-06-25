@@ -24,9 +24,27 @@ measurement basis for later approved experiments.
 - Top-K ranking: computed using only the training period.
 - Supporting audit: observation-state audit v2, documented in
   `docs/run_records/2026-06-25-milan-internet-audit-v2.md`.
-- Null / absent final semantic policy: remains documented as an assumption to
-  be handled by implementation. Audit v2 policy views are sensitivity
-  diagnostics only and are not canonical.
+- Null / absent external semantics: not externally proven by audit v2. EXP-001
+  uses the conservative modeling-time observation policy below.
+
+## Modeling-Time Observation Policy
+
+Approved for EXP-001-v0 modeling/materialization:
+
+- `NUMERIC_OBSERVED` uses the actual numeric traffic value.
+- `ALL_NULL` is treated as missing / unobserved, not semantic zero.
+- `ABSENT` is treated as missing / unobserved, not semantic zero.
+- If a dense value tensor or table is materialized, missing positions may be
+  filled with `0` only as a placeholder.
+- Any placeholder zero for missing values must be accompanied by an explicit
+  observation mask.
+- Normalization must be fitted using training-period observed numeric values
+  only.
+- Loss and metrics must use the observation mask and must not treat placeholder
+  zeros as observed traffic.
+
+This policy does not claim that null or absent semantics are externally proven.
+It is a conservative modeling policy based on audit v2.
 
 ## Chronological Split
 
@@ -163,8 +181,8 @@ committed after human approval.
 
 - Final baseline model set.
 - Input window and prediction horizon.
-- Normalization policy implementation.
-- Null / absent handling policy for modeling.
+- Normalization implementation details, subject to the approved observation
+  policy above.
 - Unreliable-gap threshold.
 - Whether to run factor sensitivity.
 - Whether results are reportable.
