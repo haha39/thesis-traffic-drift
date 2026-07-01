@@ -1,0 +1,35 @@
+experiment_id: MGSTC-feasibility-gate-v0
+raw_milan_daily_dir: "${MILAN_RAW_DIR}"
+output_dir: "artifacts/local/mgstc_gate"
+traffic_field: "total"
+grid_rows: 100
+grid_cols: 100
+center_rows: 30
+center_cols: 30
+center_row_start: 40
+center_col_start: 40
+timezone: "Europe/Rome"
+resolution_minutes: 10
+expected_total_days: 62
+expected_total_timestamps: 8928
+train_days: 5
+validation_days: 2
+test_days: 55
+input_length: 128
+prediction_horizon: 60
+normalization: "train_only_minmax"
+allow_internet_fallback: true
+total_training_mask: "fully_observed"
+# Builder-1 contract: total-traffic normalization and clean training use
+# fully_observed_mask only. "observed" is not a supported alternative here.
+missing_policy:
+  observed_rule: "total_requires_at_least_one_numeric_component"
+  total_value_rule: "sum_available_numeric_components_only"
+  fully_observed_rule: "all_five_components_numeric"
+  internet_rule: "internet_numeric_only"
+  null_rule: "mask_missing"
+  absent_rule: "mask_missing"
+  partial_rule: "mask_missing"
+  invalid_rule: "mask_missing"
+  placeholder_zero_requires_observed_mask_zero: true
+  preserve_state_code: true
