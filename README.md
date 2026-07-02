@@ -1,13 +1,15 @@
-# Thesis Traffic Drift Experiments
+# Thesis Traffic Drift Harnesses
 
-This repository contains the thesis experiment harness for Milan Internet traffic
-drift, stale model degradation, and model-agnostic recovery experiments.
+This repository contains public-safe thesis experiment harnesses for traffic
+drift and stale analytics work.
 
-It is separate from:
-- reproduction records;
-- raw or processed datasets;
-- free5GC / NWDAF testbed repositories.
+Current tracked work:
+- EXP-001 controlled local-shift harness on Milan Internet traffic.
+- MGSTC feasibility-gate scaffold for Milan total-traffic center-900
+  preprocessing and materialization planning.
 
-This repository should contain code, configs, experiment specs, run records, and
-review notes. It should not contain raw Milan data, processed tensors, checkpoints,
-private testbed configs, or large artifacts unless explicitly approved.
+This repository contains code, configs, specs, run records, and review notes.
+It does not contain raw data, processed tensors, checkpoints, private testbed
+configs, or large generated artifacts.
+
+It does not claim results are ready for thesis use or full MGSTC reproduction.
