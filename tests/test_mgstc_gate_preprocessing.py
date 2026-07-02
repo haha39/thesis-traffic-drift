@@ -474,6 +474,22 @@ class MgstcGatePreprocessingTests(unittest.TestCase):
                 self.assertTrue(manifest_disk["not_full_mgstc_reproduction"])
                 self.assertEqual(manifest_disk["paper_alignment_status"], "feasibility_scaffold_with_assumptions")
                 self.assertTrue(manifest_disk["fig6_inferred_900_region"])
+                self.assertIn("manifest.json", manifest_disk["files"])
+                self.assertEqual(
+                    manifest_disk["files"],
+                    [
+                        "arrays/clean_test.npz",
+                        "arrays/clean_train.npz",
+                        "arrays/clean_validation.npz",
+                        "indices/cell_index.csv",
+                        "indices/split_index.csv",
+                        "indices/timestamp_index.csv",
+                        "manifest.json",
+                        "metadata.json",
+                        "summaries/observation_counts_by_split.csv",
+                        "summaries/validation_checks.json",
+                    ],
+                )
 
                 expected_npz_members = {
                     "values.npy",

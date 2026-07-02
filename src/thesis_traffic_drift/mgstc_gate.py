@@ -602,6 +602,17 @@ def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def output_file_inventory(output_dir: Path, extra_files: Optional[Sequence[str]] = None) -> List[str]:
+    files = {
+        str(path.relative_to(output_dir))
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    }
+    if extra_files:
+        files.update(str(path) for path in extra_files)
+    return sorted(files)
+
+
 def materialize_mgstc_gate(
     config: Mapping[str, Any],
     raw_dir: Path,
@@ -861,11 +872,7 @@ def materialize_mgstc_gate(
             "partial_totals_not_clean_training_by_default": True,
         },
         "arrays": arrays_manifest,
-        "files": sorted(
-            str(path.relative_to(output_dir))
-            for path in output_dir.rglob("*")
-            if path.is_file()
-        ),
+        "files": output_file_inventory(output_dir, extra_files=("manifest.json",)),
     }
     write_json(output_dir / "manifest.json", manifest)
     return metadata, manifest
